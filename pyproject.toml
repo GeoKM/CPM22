@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cpm22"
+version = "0.1.0"
+description = "IMSAI 8080 CP/M 2.2 emulator in Python with Tk front panel"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Keith Matthews"},
+]
+keywords = ["im", "sai", "8080", "cpm", "emulator", "retro", "vintage"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: MacOS X",
+    "Intended Audience :: Education",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Emulators",
+]
+
+[project.scripts]
+cpm22 = "cpm22.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["cpm22*"]
+
+[tool.setuptools.package-data]
+cpm22 = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"

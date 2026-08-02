@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Disk images (we keep checked-in samples, ignore generated ones)
+disk_images/*.img
+disk_images/*.dsk
+!disk_images/.gitkeep
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Saved state
+*.sav
+*.state

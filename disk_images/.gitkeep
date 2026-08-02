@@ -1,0 +1,8 @@
+# Disk images
+
+The committed sample images will land in M4:
+
+- `cpm22-sssd.img` — 8" SSSD 256KB, contains CCP, BDOS, BIOS + utilities (PIP, STAT, ED, DDT, SUBMIT, SYSGEN)
+- `cpm22-ssdd.img` — 8" SSDD 512KB, same content, double-density format
+
+This `.gitkeep` ensures the directory is tracked even before M4 ships.
