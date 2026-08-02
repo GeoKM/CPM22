@@ -16,6 +16,7 @@ import pytest
 
 from cpm22.cpm_system import CPMSystem
 from cpm22.cpm_bios import BOOT_ENTRY, VECTOR_BASE, SYSTEM_BASE
+from cpm22.minimal_ccp import CCP_BASE as MINIMAL_CCP_BASE
 
 CPM_SYS = "disk_images/cpm22-sssd.img"
 SIGNON_PREFIX = "CP/M"
@@ -81,7 +82,9 @@ def test_system_does_not_crash_on_init():
     """Just constructing and cold-booting the system shouldn't crash."""
     sys = CPMSystem(CPM_SYS)
     sys.cold_boot()
-    assert sys.cpu.PC == BOOT_ENTRY  # CCP entry
+    # PC is at the minimal CCP entry (BOOT_ENTRY is overridden by 0x0000 JP
+    # to the minimal CCP).
+    assert sys.cpu.PC == MINIMAL_CCP_BASE  # minimal CCP entry
     assert sys.cpu.SP == 0xFFFF
 
 
@@ -102,14 +105,15 @@ def test_bios_vector_table_at_correct_address():
 
 
 def test_bios_stub_format():
-    """Each stub is MVI A, fn; OUT 0xF0; RET."""
+    """Each stub is MVI A, fn; OUT 0xF1; RET."""
     sys = CPMSystem(CPM_SYS)
+    from cpm22.cpm_bios import BIOS_PORT
     for i in range(17):
         off = 0xDC00 + i * 5
         # 0x3E nn (MVI A, nn)
         assert sys.mem.rb(off) == 0x3E, f"stub[{i}] not MVI A"
         assert sys.mem.rb(off + 2) == 0xD3, f"stub[{i}] not OUT"
-        assert sys.mem.rb(off + 3) == 0xF0, f"stub[{i}] not port 0xF0"
+        assert sys.mem.rb(off + 3) == BIOS_PORT, f"stub[{i}] not port 0x{BIOS_PORT:02x}"
         assert sys.mem.rb(off + 4) == 0xC9, f"stub[{i}] not RET"
         # fn is in byte off+1
         fn = sys.mem.rb(off + 1)

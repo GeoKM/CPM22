@@ -36,7 +36,9 @@ from cpm22 import asm8080 as A
 # Port used for BIOS-call dispatch. Each BIOS stub writes its function
 # number to A and does `OUT 0xF0`. Python's BIOS port handler reads A,
 # dispatches, and returns (CPU then executes the following RET).
-BIOS_PORT = 0xF0
+# We use a separate port for BDOS (BDOS_PORT) so the Python dispatcher
+# can tell which layer the call is from.
+BIOS_PORT = 0xF1
 
 # Function numbers (must match cpm_bios.BIOSHandler.dispatch)
 FN_BOOT = 0x00
@@ -58,15 +60,15 @@ FN_LISTST = 0x0F
 FN_SECTRAN = 0x10
 
 
-def _stub(fn: int) -> bytes:
-    """A BIOS stub: MVI A, fn; OUT 0xF0; RET.
+def _stub(fn: int, port: int = BIOS_PORT) -> bytes:
+    """A BIOS stub: MVI A, fn; OUT port; RET.
 
     All 17 BIOS functions are this exact same 5-byte pattern. The Python
     BIOS dispatch handler reads A and calls the corresponding Python method.
     """
     return (
         A.MVI("A", fn)            # 0x3E nn       (2 bytes)
-        + A.OUT(BIOS_PORT)        # 0xD3 0xF0     (2 bytes)
+        + A.OUT(port)             # 0xD3 0xF1     (2 bytes)
         + A.RET                   # 0xC9          (1 byte)
     )
 
