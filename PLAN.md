@@ -79,23 +79,12 @@
 
 **Acceptance:** `python -m cpm22 --headless --boot disk_images/cpm22-sssd.img` prints the CP/M 2.2 banner to stdout.
 
-### M3 — Port the BIOS/CCP/BDOS
-**Files:** `cpm22/cpm_bios.py`, `cpm22/cpm_bdos.py`, `cpm22/cpm_ccp.py`
-- Reimplement BIOS in Python (don't try to assemble the original 8080 source — port it, function by function):
-  - `boot` — read tracks 0–1 from floppy A:, jump to CCP
-  - `wboot` — re-read CCP+BDOS from floppy
-  - `const` — 8251 RX ready?
-  - `conin` — read 8251 RX byte
-  - `conout` — write 8251 TX byte
-  - `list`, `punch`, `reader`, `listst` — return 0/0xFF stubs
-  - `home`, `settrk`, `setsec`, `setdma`, `read`, `write` — direct floppy image access
-  - `seldsk` — drive select, return DPHB address
-  - `sectran` — apply IBM 8" sector skew
-
-- CCP and BDOS: port the original `OS2CCP.ASM` and `OS3BDOS.ASM` logic into Python classes. We don't need to execute the original Z80 bytes — we re-implement in Python for clarity and to avoid the CPA (8080) vs Z80 divergence. The **interface** is the same (BDOS entry point 0x0005 with function in C, FCBs in standard layout), so the original OS *software* (PIP, STAT, ED, DDT, MBASIC) will work if we boot a real CP/M disk image.
-- CCP commands to implement: DIR, TYPE, ERA, REN, SAVE, USER, plus the standard `command.COM` execution flow
-
-- Actually — **alternative** to writing CCP/BDOS in Python: build an actual 8080 binary of the original CP/M 2.2 source using a CP/M-targeted assembler (we'd write a minimal 8080 cross-assembler, or shell out to a hosted assembler). This is more authentic and lets us boot real CP/M distribution disk images. **Decision:** go with the authentic binary port — it's a bigger M3 but the rest of the project becomes "boot any real CP/M 2.2 software." I'll write a tiny 8080 cross-assembler in Python (similar to the Z80 one in the skill, but simpler since 8080 has 244 opcodes with no prefixes).
+### M3 — BIOS port + pre-built CP/M 2.2 binary
+**Files:** `cpm22/cpm_bios.py`, `cpm22/asm8080.py` (minimal, only for the BIOS jump vector)
+- **Pre-built CP/M 2.2 system image**: download from `cpm.z80.de` / classic archives — the relocatable CCP+BDOS binary that's been used by every CP/M 2.2 emulator since 1982. Run `MOVCPM 64 *` to relocate it to the top of our 64KB address space. We do NOT assemble the source. This is the "authentic bytes" path, just with the bytes already built for us.
+- **BIOS**: hand-written minimal 8080 assembly for the IMSAI-specific 17 entry points. We do write a tiny assembler (or hand-encode) for ~200 bytes of BIOS — this is the only place we generate 8080 bytes ourselves, and it's small enough to test exhaustively. Source: port the structure from `OS4BIOS.ASM`, replace the MDS-800 I/O ports (0x78–0x7F) with our 8251 USART ports (0x10/0x11).
+- **BDOS entry**: a 3-byte trampoline at `0x0005`: `MOV A, C; JMP 0x0005+5` — wait, that's circular. Standard CP/M 2.2 convention: `0x0005` contains `JP BDOS_ENTRY`. We just write 3 bytes there.
+- **BIOS jump vector**: at top of 64KB (e.g. 0xFA00) — 17 `JMP`s, one per entry. The pre-built CP/M 2.2 calls these by hardcoded address, so the location is fixed by the relocated binary.
 
 **Test:** `tests/test_bios.py` — boot from real `cpm22-sssd.img`, run CCP, type `DIR`, verify the directory listing comes out. Use the same busy-wait + `time.sleep(0.001)` pattern from Section 3 of the skill.
 
