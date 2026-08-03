@@ -105,7 +105,12 @@ class CPMSystem:
     dispatch reads A and routes to the appropriate method.
     """
 
-    def __init__(self, cpm_sys_path: str, rbuf_deadline: float = 5.0):
+    def __init__(
+        self,
+        cpm_sys_path: str,
+        rbuf_deadline: float = 5.0,
+        use_dr_system: bool = False,
+    ):
         """Create the CP/M system.
 
         Args:
@@ -115,8 +120,12 @@ class CPMSystem:
                 returning with no input. Default 5s (real CP/M waits indefinitely).
                 Tests should set this to a small value (e.g. 0.5) to keep the
                 test harness fast.
+            use_dr_system: if True, load the authentic Digital Research CP/M 2.2
+                binaries (cross-assembled from OS2CCP.ASM, OS3BDOS.ASM, OS4BIOS.ASM)
+                instead of the stub BDOS + minimal CCP. This is the real deal.
         """
         self.rbuf_deadline = rbuf_deadline
+        self.use_dr_system = use_dr_system
         self.mem = Memory()
         self.cpu = CPU8080(self.mem)
         self.usart = USART8251()
@@ -128,12 +137,24 @@ class CPMSystem:
         self._dma = 0x0080
         # BDOS state
         self._console_output_buffer: list[int] = []
-        # NOTE: We do NOT load the XEROX 1800 system image. The XEROX BDOS
-        # uses non-standard function numbering and a buried vector base that
-        # makes it incompatible with our BIOS port map. Instead, we install
-        # our own minimal CCP at 0xE100 and our stub BDOS at 0xE000. The
-        # XEROX image is reserved for future M4 work (booting real CP/M
-        # disk images) where we'll cross-assemble the DR source.
+        # Choose between authentic DR CP/M 2.2 and stub BDOS + minimal CCP.
+        if use_dr_system:
+            self._load_dr_system()
+        else:
+            self._load_stub_system()
+        # Wire the BDOS port handler (port 0xF0)
+        self.cpu.out_port[BDOS_PORT] = self._bdos_dispatch
+        # Wire the BIOS port handler (port 0xF1)
+        self.cpu.out_port[BIOS_PORT] = self._bios_dispatch
+        # Wire the 8251 USART to CPU ports
+        self.usart.attach_to_cpu(self.cpu)
+
+    def _load_stub_system(self):
+        """Install the stub BDOS + minimal CCP at 0xE000/0xE100.
+
+        This is the M2 baseline: a tiny CP/M that responds to a few CCP
+        commands (DIR, TYPE, ERA) using the Python stub BDOS dispatch.
+        """
         # Install the stub BDOS at 0xE000.
         stub = build_stub_bdos(BIOS_PORT=BDOS_PORT)
         for i, b in enumerate(stub):
@@ -146,7 +167,6 @@ class CPMSystem:
         for addr, s in get_ccp_strings().items():
             for i, b in enumerate(s):
                 self.mem.wb(addr + i, b)
-        # The XEROX image is NOT loaded — leave its area as zeros
         # Patch the BDOS entry trampoline at 0x0005 to point to the stub BDOS
         self.mem.wb(0x0005, 0xC3)                          # JP
         self.mem.wb(0x0006, STUB_BDOS_BASE & 0xFF)          # low byte
@@ -155,14 +175,52 @@ class CPMSystem:
         self.mem.wb(0x0000, 0xC3)                          # JP
         self.mem.wb(0x0001, MINIMAL_CCP_BASE & 0xFF)         # low byte
         self.mem.wb(0x0002, (MINIMAL_CCP_BASE >> 8) & 0xFF)  # high byte
-        # Wire the BDOS port handler (port 0xF0)
-        self.cpu.out_port[BDOS_PORT] = self._bdos_dispatch
-        # Wire the BIOS port handler (port 0xF1)
-        self.cpu.out_port[BIOS_PORT] = self._bios_dispatch
-        # Wire the 8251 USART to CPU ports
-        self.usart.attach_to_cpu(self.cpu)
         # Override the BIOS vector table at 0xF800 to point to our stubs
         self._install_bios_vector_table()
+
+    def _load_dr_system(self):
+        """Load the authentic Digital Research CP/M 2.2 binaries.
+
+        Cross-assembles OS2CCP.ASM, OS3BDOS.ASM, OS4BIOS.ASM from the original
+        DR source and places them at the correct memory addresses. The BIOS
+        jump table at 0xF000 is patched to point at our Python-driven stubs
+        (since the assembled BIOS code references real hardware we don't
+        have — 8251 USART, 1771 floppy controller — but the stubs provide
+        the same functional interface via port 0xF1).
+        """
+        from cpm22.dr_loader import build_dr_cpm_system
+        from cpm22.boot_stub import build_boot_stub, BOOT_VECTORS
+        sys = build_dr_cpm_system()
+        # Load CCP at 0xE000
+        for i, b in enumerate(sys["ccp_bytes"]):
+            self.mem.wb(sys["ccp_load"] + i, b)
+        # Load BDOS at 0xE800
+        for i, b in enumerate(sys["bdos_bytes"]):
+            self.mem.wb(sys["bdos_load"] + i, b)
+        # Load BIOS at 0xF000 (jump table + DR code)
+        for i, b in enumerate(sys["bios_bytes"]):
+            self.mem.wb(sys["bios_load"] + i, b)
+        # Load BIOS stub dispatchers at 0xC000
+        for i, b in enumerate(sys["bios_stubs"]):
+            self.mem.wb(sys["bios_stub_base"] + i, b)
+        # Install the pre-boot ROM stub at 0x0100 (TPA — unused by CP/M).
+        # When no disk is mounted, BDOS init crashes; this stub intercepts
+        # the cold-boot vector and prompts the user to insert a disk.
+        stub = build_boot_stub()
+        for i, b in enumerate(stub):
+            self.mem.wb(0x0100 + i, b)
+        # Patch the boot vectors at 0x0000-0x0007
+        for i, b in enumerate(BOOT_VECTORS):
+            self.mem.wb(0x0000 + i, b)
+        # Auto-mount the CP/M 2.2 system disk on drive A. This gives BDOS
+        # something to read when CCP runs its init sequence. Without a disk,
+        # BDOS init crashes (seeks to garbage because disk params are 0).
+        from cpm22.floppy import FloppyImage
+        from pathlib import Path
+        disk_path = Path(__file__).parent.parent / "disk_images" / "CPM22_SSSD.img"
+        if disk_path.exists():
+            self.drives[0] = FloppyImage.from_file(str(disk_path))
+            print(f"Auto-mounted {disk_path.name} on drive A")
 
     # ------------------------------------------------------------------
     # BIOS vector table — replace the XEROX 1800 vectors with our stubs

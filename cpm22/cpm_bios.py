@@ -148,8 +148,8 @@ def build_bios_stubs() -> bytes:
 SYSTEM_BASE = 0xE200
 SYSTEM_SIZE = 0x1E00     # 7,680 bytes
 VECTOR_BASE = 0xF800     # BIOS vector table in the relocated image
-BOOT_ENTRY = 0xE200      # first JP target in the image
-WBOOT_ENTRY = 0xE203     # second JP target
+BOOT_ENTRY = 0xE000      # CCP starts here in DR CP/M 2.2 (JP to ccpstart at 0xE350)
+WBOOT_ENTRY = 0xE000     # Warm boot also re-enters CCP via the same JP
 
 
 def load_cpm_sys_into(mem, cpm_sys_path: str) -> int:
