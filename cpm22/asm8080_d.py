@@ -284,11 +284,20 @@ TABLE = _ENC.table
 # Supports: numbers (decimal, hex 0xxh/xxh, binary xxxb, octal xxxq/o),
 # labels, $, +, -, *, /, &, |, ^, %, not, parens.
 
-_HEX_RE = re.compile(r"^[0-9a-fA-F]+h$|^[0-9a-f]+$")
+def _normalize_label(name: str) -> str:
+    """Normalize a label by stripping DR-syntax '$' separators.
+
+    In DR's macro assembler, '$' is a label separator for readability,
+    so 'seek$dir' and 'seekdir' refer to the same label.
+    """
+    return name.replace("$", "")
+
+
+_HEX_RE = re.compile(r"^[0-9a-fA-F]+h$|^[0-9]+$")
 _DEC_RE = re.compile(r"^[0-9]+$")
 _OCT_RE = re.compile(r"^[0-7]+o$|^[0-7]+q$")
 _BIN_RE = re.compile(r"^[01]+b$")
-_LABEL_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+_LABEL_RE = re.compile(r"^[a-zA-Z_$][a-zA-Z0-9_$]*$")
 
 
 def _to_int(token: str) -> Optional[int]:
@@ -505,10 +514,11 @@ class _ExprParser:
         if n is not None:
             self.consume()
             return n
-        # Try label
-        if t.lower() in self.labels:
+        # Try label (DR $ convention: strip $ from lookup key)
+        label_key = _normalize_label(t.lower())
+        if label_key in self.labels:
             self.consume()
-            return self.labels[t.lower()]
+            return self.labels[label_key]
         # Try opcode as numeric constant (DR allows e.g. `di or (hlt shl 8)`
         # where di and hlt are the opcode bytes)
         try:
@@ -519,16 +529,19 @@ class _ExprParser:
                 return oval
         except (ImportError, _AssembleError):
             pass
+        # Try character constant: 'A' or "A" — must come BEFORE the
+        # "undefined label → 0" fallback, otherwise single-character
+        # literals like 'A' (= 0x41 for the CCP disk-letter prompt) get
+        # silently coerced to 0.
+        if (t.startswith("'") and t.endswith("'") and len(t) == 3) or \
+           (t.startswith('"') and t.endswith('"') and len(t) == 3):
+            self.consume()
+            return ord(t[1])
         # Tolerate undefined labels: treat as 0 (placeholder for missing DR source).
         # Real BDOS would need to have these defined; for our purposes, emit
         # a call to 0x0000 and let the linker/runtime handle it.
         self.consume()
         return 0
-        # Try character constant: 'A' or "A"
-        if (t.startswith("'") and t.endswith("'") and len(t) == 3) or \
-           (t.startswith('"') and t.endswith('"') and len(t) == 3):
-            self.consume()
-            return ord(t[1])
         raise _AssembleError(f"unknown token in expression: {t!r}")
 
 
@@ -634,6 +647,17 @@ def _eval_expr(expr: str, labels: dict, current_addr: int) -> int:
     tokens = _tokenize_expr(expr)
     parser = _ExprParser(tokens, labels, current_addr)
     return parser.parse()
+
+
+def _eval_expr_safe(expr: str, labels: dict, current_addr: int) -> int:
+    """Like _eval_expr but tolerates missing labels (returns 0).
+
+    Used during pass 1 when forward references may not yet be resolved.
+    """
+    try:
+        return _eval_expr(expr, labels, current_addr)
+    except _AssembleError:
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -872,13 +896,13 @@ class Assembler:
                 ):
                     label = parts[0].lower()
                     line = parts[1]
-        is_equ = line.split(None, 1)[0].lower() == "equ" if line else False
-        if label and label not in self.labels and not is_equ:
-            self.labels[label] = self._addr
+        is_set_or_equ = line.split(None, 1)[0].lower() in ("equ", "set") if line else False
+        if label and _normalize_label(label) not in self.labels and not is_set_or_equ:
+            self.labels[_normalize_label(label)] = self._addr
         if not line:
             return
-        # For 'label equ value', evaluate the value and set the label
-        if is_equ and label:
+        # For 'label equ value' or 'label set value', evaluate the value and set the label
+        if is_set_or_equ and label:
             parts = line.split(None, 1)
             operand_str = parts[1].strip() if len(parts) > 1 else ""
             # Register alias: 'arech equ b' means arech IS register b.
@@ -887,8 +911,9 @@ class Assembler:
             if r is not None:
                 val = -(r + 10)
             else:
-                val = _eval_expr(operand_str, self.labels, self._addr)
-            self.labels[label] = val
+                # Pass 1 may not have all labels yet; tolerate missing refs
+                val = _eval_expr_safe(operand_str, self.labels, self._addr)
+            self.labels[_normalize_label(label)] = val
             return
         self._advance_for_line(line)
 
@@ -1021,12 +1046,13 @@ class Assembler:
                     line = parts[1]
 
         # Re-tokenize after label removal
+        norm_label = _normalize_label(label) if label else None
         if label:
             if self.current_pass == 1:
-                if label in self.labels:
+                if norm_label in self.labels:
                     self.errors.append(f"duplicate label: {label}")
                 else:
-                    self.labels[label] = self._addr
+                    self.labels[norm_label] = self._addr
             # If followed by nothing, just define the label
             if not line:
                 return
@@ -1054,7 +1080,7 @@ class Assembler:
             else:
                 val = _eval_expr(operand_str, self.labels, self._addr)
             if self.current_pass == 1:
-                self.labels[label] = val
+                self.labels[_normalize_label(label)] = val
             return
         if mnem == "end":
             return

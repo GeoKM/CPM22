@@ -26,6 +26,15 @@ STUB_SOURCE = r"""
         org     0100h
 stub:
         lxi     sp, 0200h
+        ; Check the 'disk-mounted' flag at 0x007F. If non-zero, skip the
+        ; prompt and jump straight to CCP. The loader sets this flag
+        ; (via self.mem.wb(0x007F, 0x01)) when a disk is auto-mounted.
+        ; NOTE: 0x007F is used instead of 0x0080 because 0x0080 is the
+        ; CP/M DMA buffer and BDOS overwrites it during directory reads.
+        lda     007Fh
+        ora     a
+        jnz     skipmsg
+
         lxi     h, msg
         call    printstr
 waitkey:
@@ -46,6 +55,10 @@ waitkey:
         mov     e, a
         mvi     a, 2
         out     0F0h
+skipmsg:
+        ; Set C = 0 (drive A, user 0) before jumping to CCP.
+        ; CCP's ccpstart reads C to extract the initial disk and user code.
+        mvi     c, 0
         jmp     0E000h          ; to CCP
 printstr:
         mov     a, m
@@ -60,11 +73,20 @@ msg:    db      'No disk in drive A.', 13, 10
         db      'Insert boot disk and press any key.', 13, 10, 0
 """
 
-# Vectors at 0x0000-0x0007 (6 bytes: DI; JMP 0x0100; ... JP 0xE800)
+# Vectors at 0x0000-0x0007 (BDOS stub that handles return for JMP-based callers)
+# Layout:
+#   0x0000: cold-boot entry → DI; JMP 0x0100 (boot stub)
+#   0x0005: BDOS entry → CALL 0xE800; RET
+# When CCP does `JMP bdos` (= JMP 0x0005), this stub CALLs BDOS so a
+# return address is pushed, then RETs back to the CCP after BDOS finishes.
+# Without this, BDOS's `retmon` pops garbage off the stack (typically 0x0000,
+# the cold-boot vector) and the system loops.
 BOOT_VECTORS = bytes([
     0xF3,                     # 0x0000: DI
     0xC3, 0x00, 0x01,         # 0x0001: JMP 0x0100 (to stub)
-    0xC3, 0x00, 0xE8,         # 0x0006: JMP 0xE800 (BDOS entry)
+    0x00,                     # 0x0004: (padding)
+    0xCD, 0x00, 0xE8,         # 0x0005: CALL 0xE800 (BDOS entry)
+    0xC9,                     # 0x0008: RET (back to CCP after BDOS returns)
 ])
 
 

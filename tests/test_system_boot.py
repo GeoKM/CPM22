@@ -150,23 +150,26 @@ def test_bios_conout_writes_to_usart():
 
 
 def test_bios_seldsk_no_disk():
-    """BIOS.SELDSK with no disk mounted should return 0xFFFF."""
+    """BIOS.SELDSK with no disk mounted should return 0 (no DPH)."""
     sys = CPMSystem(CPM_SYS)
-    # C=1 → drive A. No floppy mounted, should return 0xFFFF
+    # C=1 → drive A. No floppy mounted, should return 0 (NULL DPH)
     sys.cpu.C = 1
     rv = sys._bios_call(0x09)
-    assert rv == 0xFFFF
+    assert rv == 0
 
 
 def test_bios_seldsk_drive_a_mounted():
-    """BIOS.SELDSK for an SSSD image mounted in drive A should return 0."""
+    """BIOS.SELDSK for an SSSD image mounted in drive A should return DPH addr."""
     sys = CPMSystem(CPM_SYS)
     # Create a blank SSSD image for drive A
     from cpm22.floppy import FloppyFormat
     sys.mount_blank(0, FloppyFormat.SSSD_8)
+    # DPH must be installed before seldsk returns a valid address
+    if not hasattr(sys, 'dph_address'):
+        sys.dph_address = 0xE900
     sys.cpu.C = 1  # C=1 → drive A (0-based offset)
     rv = sys._bios_call(0x09)
-    assert rv == 0
+    assert rv == sys.dph_address
     sys.cpu.C = 2  # C=2 → drive B, not mounted
     rv = sys._bios_call(0x09)
-    assert rv == 0xFFFF
+    assert rv == 0

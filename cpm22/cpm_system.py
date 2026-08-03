@@ -142,6 +142,8 @@ class CPMSystem:
             self._load_dr_system()
         else:
             self._load_stub_system()
+        # Install DPH for both stub and DR systems (BDOS reads geometry via seldsk)
+        self._install_dph()
         # Wire the BDOS port handler (port 0xF0)
         self.cpu.out_port[BDOS_PORT] = self._bdos_dispatch
         # Wire the BIOS port handler (port 0xF1)
@@ -175,7 +177,9 @@ class CPMSystem:
         self.mem.wb(0x0000, 0xC3)                          # JP
         self.mem.wb(0x0001, MINIMAL_CCP_BASE & 0xFF)         # low byte
         self.mem.wb(0x0002, (MINIMAL_CCP_BASE >> 8) & 0xFF)  # high byte
-        # Override the BIOS vector table at 0xF800 to point to our stubs
+        # Install the BIOS jump table at VECTOR_BASE (0xF800) and stubs
+        # at 0xDC00. This is needed for both stub and DR systems because
+        # both call BIOS functions through dispatch tables.
         self._install_bios_vector_table()
 
     def _load_dr_system(self):
@@ -204,23 +208,129 @@ class CPMSystem:
         for i, b in enumerate(sys["bios_stubs"]):
             self.mem.wb(sys["bios_stub_base"] + i, b)
         # Install the pre-boot ROM stub at 0x0100 (TPA — unused by CP/M).
-        # When no disk is mounted, BDOS init crashes; this stub intercepts
-        # the cold-boot vector and prompts the user to insert a disk.
+        # When no disk is mounted, the stub prints a 'No disk' message and
+        # waits for input. When a disk is mounted, it skips straight to CCP.
         stub = build_boot_stub()
         for i, b in enumerate(stub):
             self.mem.wb(0x0100 + i, b)
         # Patch the boot vectors at 0x0000-0x0007
         for i, b in enumerate(BOOT_VECTORS):
             self.mem.wb(0x0000 + i, b)
+        # Zero out BDOS uninitialized variables. The DR source uses `ds 2`
+        # and `ds 1` for these, which leaves them containing whatever
+        # instruction bytes happen to follow. Without explicit zeroing,
+        # BDOS reads garbage pointers (especially `info`) and crashes.
+        # Variables: use the actual addresses from the assembled BDOS
+        # labels (info, aret, entsp, resel, fcbdsk). The DR source uses
+        # `ds 2` and `ds 1` for these, which leaves them containing
+        # whatever instruction bytes happen to follow. Without explicit
+        # zeroing, BDOS reads garbage pointers (especially `info`) and
+        # crashes. NOTE: these addresses must match the assembler output
+        # for the current BDOS source layout; they're computed dynamically
+        # from the labels dict returned by the assembler.
+        bdos_labels = sys.get("bdos_labels", {})
+        for var_name, var_size in [
+            ("info", 2),
+            ("aret", 2),
+            ("entsp", 2),
+            ("resel", 1),
+            ("fcbdsk", 1),
+            ("curdsk", 1),
+            ("usrcode", 1),
+            ("linfo", 1),
+            ("rodsk", 2),
+            ("dlog", 2),
+            ("lret", 1),
+            ("dirloc", 1),
+        ]:
+            if var_name in bdos_labels:
+                addr = bdos_labels[var_name]
+                for i in range(var_size):
+                    self.mem.wb(addr + i, 0)
+        # Note: dpbaddr is set by _install_dph_chain (which knows the actual
+        # DPB address). All other variables are zeroed here.
+        # Install the BIOS stubs at 0xDC00 (used by BIOS jump table at 0xE900).
+        # The DR system's bios_stubs (at 0xC000) are kept as backup but the
+        # primary dispatch path goes through 0xDC00 → 0xE900.
+        self._install_bios_vector_table()
         # Auto-mount the CP/M 2.2 system disk on drive A. This gives BDOS
         # something to read when CCP runs its init sequence. Without a disk,
         # BDOS init crashes (seeks to garbage because disk params are 0).
         from cpm22.floppy import FloppyImage
+        from cpm22.dph import build_disk_layout
         from pathlib import Path
         disk_path = Path(__file__).parent.parent / "disk_images" / "CPM22_SSSD.img"
         if disk_path.exists():
             self.drives[0] = FloppyImage.from_file(str(disk_path))
+            # Set the boot stub flag so it skips the 'No disk' message
+            self.mem.wb(0x007F, 0x01)
             print(f"Auto-mounted {disk_path.name} on drive A")
+
+    # ------------------------------------------------------------------
+    # DPH installation (called for both stub and DR systems)
+    # ------------------------------------------------------------------
+
+    def _install_dph(self) -> None:
+        """Install the DPH (Disk Parameter Header) and supporting structures.
+
+        BDOS reads these during disk initialization via the BIOS seldsk
+        function. Without a proper DPH, BDOS init crashes because it
+        reads garbage from the DPH chain.
+
+        Layout: DR CP/M expects the BIOS jump table at 0xF600 (in DR's
+        own BIOS module). We must NOT install a second BIOS jump table at
+        0xE900 — that region is used by BDOS code (conout, compout, etc.).
+        Place the DPH chain in a free area between BDOS and BIOS jump table.
+        """
+        from cpm22.dph import SSSD_8INCH, build_dph, build_dpb, build_dpb_with_phm, build_tran_table, build_alv
+        geom = SSSD_8INCH
+        # BDOS ends at ~0xF5EE. DR BIOS jump table is at 0xF600-0xF632.
+        # That leaves no room for DPH between BDOS and BIOS.
+        # Place DPH chain BEFORE BDOS in a free area: 0xE700-0xE7FF.
+        dph_addr = 0xE700
+        dpb_addr = dph_addr + 16
+        tran_addr = dpb_addr + 17
+        # SPT sectors × 2 bytes per table entry (high byte first)
+        spt = geom.spt
+        alv_addr = tran_addr + spt * 2
+        # ALV for DSM+1 bits, padded to byte boundary
+        alv_size = (geom.dsm + 8) // 8
+        scratch_addr = alv_addr + alv_size
+        dirbuf_addr = scratch_addr + 8
+        # Write the structures into memory. The DPB must be at least
+        # 15 bytes (the size BDOS copies via dpblist = 15).
+        # NOTE: build_dph's 5th positional arg is the ALV (allocation
+        # vector) base, not the dirbuf base. The dirbuf is a separate
+        # scratch area used by BDOS for directory operations; the ALV is
+        # what BDOS's "clear ALV" loop zeros out. Conflating these caused
+        # the loop to clobber CCP's user stack.
+        dph = build_dph(geom, scratch_addr, dpb_addr, tran_addr, alv_addr)
+        # Pad DPB to 17 bytes (1 padding byte after EXM aligns with the
+        # BDOS sectpt layout: spt+bsh in sectpt[0:2], then blm/exm/etc.).
+        dpb_raw = build_dpb(geom)
+        dpb = dpb_raw + bytes(max(0, 17 - len(dpb_raw)))
+        tran = bytearray()
+        for s in build_tran_table(geom):
+            tran.append(s & 0xFF)
+            tran.append((s >> 8) & 0xFF)
+        alv = build_alv(geom)
+        for i, b in enumerate(dph):
+            self.mem.wb(dph_addr + i, b)
+        for i, b in enumerate(dpb):
+            self.mem.wb(dpb_addr + i, b)
+        for i, b in enumerate(tran):
+            self.mem.wb(tran_addr + i, b)
+        for i, b in enumerate(alv):
+            self.mem.wb(alv_addr + i, b)
+        # scratch and dirbuf are zero-initialized
+        self.dph_address = dph_addr
+        # Initialize dpbaddr to point at the DPB we just installed.
+        from cpm22.dr_loader import build_dr_cpm_system
+        bdos_labels = build_dr_cpm_system().get("bdos_labels", {})
+        if "dpbaddr" in bdos_labels:
+            dpb_var_addr = bdos_labels["dpbaddr"]
+            self.mem.wb(dpb_var_addr, dpb_addr & 0xFF)
+            self.mem.wb(dpb_var_addr + 1, (dpb_addr >> 8) & 0xFF)
 
     # ------------------------------------------------------------------
     # BIOS vector table — replace the XEROX 1800 vectors with our stubs
@@ -527,11 +637,16 @@ class CPMSystem:
     # ------------------------------------------------------------------
 
     def _bios_dispatch(self, cpu, val: int) -> None:
-        """Handle OUT 0xF0, A. The 8080's A register holds the function number."""
+        """Handle OUT 0xF1, A. The 8080's A register holds the function number."""
         fn = cpu.A
         ret = self._bios_call(fn)
-        cpu.A = ret & 0xFF
-        cpu.L = ret & 0xFF  # some BDOS calls return value in A or HL
+        if fn == FN_SELDSK:
+            # seldsk returns the DPH address in HL (CP/M convention)
+            cpu.H = (ret >> 8) & 0xFF
+            cpu.L = ret & 0xFF
+        else:
+            cpu.A = ret & 0xFF
+            cpu.L = ret & 0xFF  # some BDOS calls return value in A or HL
 
     def _bios_call(self, fn: int) -> int:
         if fn == FN_BOOT:
@@ -638,9 +753,11 @@ class CPMSystem:
         else:
             drive -= 1
         if drive < 0 or drive > 1 or self.drives[drive] is None:
-            return 0xFFFF  # no disk
+            return 0  # no disk — return NULL per CP/M convention
         self.current_drive = drive
-        return 0  # return a DPHB address; we don't use it, but spec is 0 for OK
+        # Return the DPH address for drive A (or B if we add one)
+        # For now, both drives share the same DPH (single geometry)
+        return self.dph_address
 
     def _bios_settrk(self) -> int:
         self._track = self.cpu.C
@@ -659,6 +776,8 @@ class CPMSystem:
         if drive is None:
             return 0x01  # error
         try:
+            # Sync DMA address from CPMSystem to floppy
+            drive.dma_addr = self._dma
             drive.read_to_dma(self.mem, self._track, self._sector)
             return 0
         except Exception:

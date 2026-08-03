@@ -30,7 +30,7 @@ from cpm22.asm8080 import MVI, OUT, RET
 # Memory addresses
 CCP_LOAD = 0xE000     # where CCP is placed in memory
 BDOS_LOAD = 0xE800    # where BDOS is placed
-BIOS_LOAD = 0xF000    # where BIOS jump table starts
+BIOS_LOAD = 0xF600    # where BIOS jump table starts (BDOS builds bios as ($ and 0ff00h)+100h)
 BIOS_STUB_BASE = 0xC000  # where BIOS Python-stub dispatchers live
 
 # The DR source uses logical addresses (org 000h for CCP, org 0800h for BDOS,
@@ -38,7 +38,7 @@ BIOS_STUB_BASE = 0xC000  # where BIOS Python-stub dispatchers live
 # directly at our physical addresses without relocation.
 CCP_ORG = 0xE000
 BDOS_ORG = 0xE800
-BIOS_PATCH = 0xF000
+BIOS_PATCH = 0xF600
 
 # BIOS jump table offsets (relative to BIOS_LOAD = 0xF000)
 BIOS_JMP_OFFSETS = {
@@ -106,7 +106,8 @@ def _patch_bios_jmp_table(bios_bytes: bytearray, stub_base: int) -> None:
         stub_addr += 5  # each stub is 5 bytes
 
 
-def _assemble_dr_source(src_path: str, org_overrides: dict = {}) -> bytes:
+def _assemble_dr_source(src_path: str, org_overrides: dict = {},
+                        return_labels: bool = False):
     """Assemble a DR source file at its native logical addresses.
 
     The source files contain their own 'org' directives that override the
@@ -115,6 +116,7 @@ def _assemble_dr_source(src_path: str, org_overrides: dict = {}) -> bytes:
     org_overrides: optional dict of {regex_pattern: replacement} applied to
     the source before assembly, to rewrite org directives to physical
     addresses instead of logical ones.
+    return_labels: if True, return (code, labels_dict) tuple.
     """
     asm = Assembler()
     text = Path(src_path).read_text(errors="replace")
@@ -133,6 +135,11 @@ def _assemble_dr_source(src_path: str, org_overrides: dict = {}) -> bytes:
         f.write(text)
         tmp = f.name
     code, _ = asm.assemble_file(tmp, org_addr=0)
+    if return_labels:
+        # Adjust labels by BDOS_ORG since we assembled at logical address
+        # (the source 'org' was rewritten to BDOS_ORG = 0xE800)
+        adjusted = {n: addr for n, addr in asm.labels.items()}
+        return code, adjusted
     return code
 
 
@@ -158,7 +165,12 @@ def build_dr_cpm_system() -> dict:
     }
     bdos_overrides = {
         r"^\s*org\s+0dc00h\s*$": f"\torg\t{BDOS_ORG + 0x500:04x}h",  # testing branch
-        r"^\s*org\s+0800h\s*$": f"\torg\t{BDOS_ORG:04x}h",
+        # Rewrite the original 'org 0800h' to our BDOS base AND inject a
+        # `bios equ 0xF600` line so the `set` directives near the top of
+        # the source (which build bootf, wbootf, etc. as `bios+3*N`)
+        # resolve correctly. The source's own `bios equ ($ and 0ff00h)+100h`
+        # at the end evaluates to the same value (0xF600 for BDOS at 0xE800).
+        r"^\s*org\s+0800h\s*$": f"\torg\t{BDOS_ORG:04x}h\nbios\tequ\t{BDOS_ORG + 0xE00:04x}h",
     }
     bios_overrides = {
         r"^patch\s+equ\s+1600h\s*$": f"patch\tequ\t{BIOS_PATCH:04x}h",
@@ -166,8 +178,12 @@ def build_dr_cpm_system() -> dict:
 
     # Assemble CCP
     ccp = bytearray(_assemble_dr_source(str(src_dir / "OS2CCP.ASM"), ccp_overrides))
-    # Assemble BDOS
-    bdos = bytearray(_assemble_dr_source(str(src_dir / "OS3BDOS.ASM"), bdos_overrides))
+    # Assemble BDOS (capture labels so we can zero out uninitialized variables
+    # at their actual addresses, not hardcoded addresses that may collide with
+    # live code if the source layout shifts).
+    bdos_code, bdos_labels = _assemble_dr_source(
+        str(src_dir / "OS3BDOS.ASM"), bdos_overrides, return_labels=True)
+    bdos = bytearray(bdos_code)
     # Assemble BIOS
     bios = bytearray(_assemble_dr_source(str(src_dir / "OS4BIOS.ASM"), bios_overrides))
 
@@ -191,4 +207,5 @@ def build_dr_cpm_system() -> dict:
         "bios_load": BIOS_LOAD,
         "cold_boot_vec": cold_boot_vec,
         "bdos_vec": bdos_vec,
+        "bdos_labels": bdos_labels,
     }

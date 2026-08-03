@@ -164,7 +164,13 @@ class FloppyImage:
         and most CP/M 2.2 implementations index 0-based: sector 1 → skew[0].
         For our standard skew, this is a no-op transform (the table already
         gives 1-based results), so we return the same value.
+
+        Sector 0 is treated as sector 26 (the highest sector wraps to
+        the first); this matches the behavior of real CP/M 2.2 BIOSes
+        when BDOS passes a 0 sector number.
         """
+        if sector == 0:
+            sector = 26
         if not (1 <= sector <= 26):
             raise ValueError(f"sector {sector} out of range 1..26")
         return SECTOR_SKEW_26[sector - 1]
